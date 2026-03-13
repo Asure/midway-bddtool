@@ -1,0 +1,1 @@
+/usr/bin/cc -g -no-pie CMakeFiles/bddview.dir/bddview.c.o -o bddview  /usr/lib/x86_64-linux-gnu/libSDL2main.a /usr/lib/x86_64-linux-gnu/libSDL2.so 

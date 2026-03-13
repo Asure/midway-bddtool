@@ -1,0 +1,3 @@
+/home/alex/midway-bddview/build/CMakeFiles/bddview.dir
+/home/alex/midway-bddview/build/CMakeFiles/edit_cache.dir
+/home/alex/midway-bddview/build/CMakeFiles/rebuild_cache.dir

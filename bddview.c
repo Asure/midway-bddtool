@@ -65,6 +65,13 @@ static Obj  g_obj[MAX_OBJECTS]; static int g_no = 0;
 static char g_name[64] = "";
 static int  g_have_bdb = 0;
 
+/* BDB save state — header and module lines stored verbatim on load */
+#define MAX_MODULES 32
+static char g_bdb_path[512]                = "";
+static char g_bdb_header[256]              = "";
+static char g_bdb_modules[MAX_MODULES][256];
+static int  g_bdb_num_modules              = 0;
+
 /* Palettes loaded from BDD tail section (15-bit RGB → ARGB8888).
    Stored in the order they appear in the BDD file; the BDB fl field
    is the 0-based index into this list. */
@@ -77,8 +84,14 @@ static int    g_n_pals = 0;
 static SDL_Texture *g_tip_tex = NULL;
 static int g_tip_x, g_tip_y, g_tip_w, g_tip_h;
 
-/* forward declaration */
+/* Save-confirmation popup */
+static SDL_Texture *g_popup_tex = NULL;
+static int g_popup_w, g_popup_h;
+static int g_confirm_save = 0; /* 1 = popup visible, waiting for Y/N */
+
+/* forward declarations */
 static Img *img_find(int idx);
+static void font_draw_str(SDL_Surface *surf, int x, int y, const char *s, Uint32 fg);
 
 /* ------------------------------------------------------------------ */
 /* BDD loader                                                           */
@@ -181,11 +194,17 @@ static int bdb_load(const char *path)
     FILE *f = fopen(path, "r");
     if (!f) { fprintf(stderr, "bdb: cannot open %s\n", path); return 0; }
 
+    snprintf(g_bdb_path, sizeof g_bdb_path, "%s", path);
+
     char ln[256];
 
     /* line 1: name world_w world_h max_depth num_modules num_pals num_objects */
     int num_modules = 1;
     if (fgets(ln, sizeof ln, f)) {
+        /* store verbatim (strip trailing newline for clean re-emission) */
+        snprintf(g_bdb_header, sizeof g_bdb_header, "%s", ln);
+        g_bdb_header[strcspn(g_bdb_header, "\r\n")] = '\0';
+
         char nm[64]; int ww, wh, md, nm2, np, no2;
         if (sscanf(ln, "%63s %d %d %d %d %d %d",
                    nm, &ww, &wh, &md, &nm2, &np, &no2) >= 5) {
@@ -196,9 +215,14 @@ static int bdb_load(const char *path)
         }
     }
 
-    /* skip module lines */
-    for (int m = 0; m < num_modules; m++)
-        (void)fgets(ln, sizeof ln, f);
+    /* store and skip module lines */
+    g_bdb_num_modules = 0;
+    for (int m = 0; m < num_modules && m < MAX_MODULES; m++) {
+        if (!fgets(ln, sizeof ln, f)) break;
+        snprintf(g_bdb_modules[g_bdb_num_modules], 256, "%s", ln);
+        g_bdb_modules[g_bdb_num_modules][strcspn(g_bdb_modules[g_bdb_num_modules], "\r\n")] = '\0';
+        g_bdb_num_modules++;
+    }
 
     g_no = 0;
     while (fgets(ln, sizeof ln, f) && g_no < MAX_OBJECTS) {
@@ -242,6 +266,117 @@ static int bdb_load(const char *path)
 
     fprintf(stderr, "bdb: loaded %d objects from %s\n", g_no, path);
     return g_no > 0;
+}
+
+/* BDB save                                                             */
+/* ------------------------------------------------------------------ */
+
+static int bdb_save(const char *path)
+{
+    FILE *f = fopen(path, "w");
+    if (!f) { fprintf(stderr, "bdb: cannot write %s\n", path); return 0; }
+
+    fprintf(f, "%s\n", g_bdb_header);
+    for (int m = 0; m < g_bdb_num_modules; m++)
+        fprintf(f, "%s\n", g_bdb_modules[m]);
+
+    /* write objects in original file order */
+    Obj *sorted[MAX_OBJECTS];
+    for (int i = 0; i < g_no; i++) sorted[i] = &g_obj[i];
+    /* insertion sort by order field */
+    for (int i = 1; i < g_no; i++) {
+        Obj *tmp = sorted[i];
+        int j = i - 1;
+        while (j >= 0 && sorted[j]->order > tmp->order) {
+            sorted[j + 1] = sorted[j];
+            j--;
+        }
+        sorted[j + 1] = tmp;
+    }
+
+    for (int i = 0; i < g_no; i++) {
+        Obj *o = sorted[i];
+        fprintf(f, "%X %d %d %X %d\n", o->wx, o->depth, o->sy, o->ii, o->fl);
+    }
+
+    fclose(f);
+    fprintf(stderr, "bdb: saved %d objects to %s\n", g_no, path);
+    return 1;
+}
+
+/* Copy src → dst byte-for-byte (used for .BAK) */
+static int file_copy(const char *src, const char *dst)
+{
+    FILE *in  = fopen(src, "rb");
+    FILE *out = fopen(dst, "wb");
+    if (!in || !out) {
+        if (in)  fclose(in);
+        if (out) fclose(out);
+        return 0;
+    }
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof buf, in)) > 0)
+        fwrite(buf, 1, n, out);
+    fclose(in);
+    fclose(out);
+    return 1;
+}
+
+/* Save-confirmation popup                                              */
+/* ------------------------------------------------------------------ */
+
+static void popup_free(void)
+{
+    if (g_popup_tex) { SDL_DestroyTexture(g_popup_tex); g_popup_tex = NULL; }
+}
+
+static void popup_build(SDL_Renderer *rend, int ww, int wh)
+{
+    popup_free();
+
+    const char *line0 = "Save changes to:";
+    const char *line2 = "Y = save    N = cancel";
+    int namelen  = (int)strlen(g_bdb_path);
+    int wide     = namelen > (int)strlen(line2) ? namelen : (int)strlen(line2);
+    if (wide < (int)strlen(line0)) wide = (int)strlen(line0);
+
+    int pad = 10;
+    int lh  = 12;
+    int sw  = wide * 8 + pad * 2;
+    int sh  = 4 * lh  + pad * 2;  /* 4 lines */
+
+    SDL_Surface *surf = SDL_CreateRGBSurface(0, sw, sh, 32,
+        0x00FF0000u, 0x0000FF00u, 0x000000FFu, 0xFF000000u);
+    if (!surf) return;
+
+    SDL_FillRect(surf, NULL, SDL_MapRGBA(surf->format, 20, 20, 36, 240));
+
+    /* border */
+    SDL_Rect border = { 0, 0, sw, sh };
+    Uint32 bcol = SDL_MapRGBA(surf->format, 200, 200, 80, 255);
+    for (int x = 0; x < sw; x++) {
+        ((Uint32 *)surf->pixels)[x]                        = bcol;
+        ((Uint32 *)surf->pixels)[(sh-1)*(sw) + x]         = bcol;
+    }
+    for (int y = 0; y < sh; y++) {
+        ((Uint32 *)surf->pixels)[y * sw]                   = bcol;
+        ((Uint32 *)surf->pixels)[y * sw + sw - 1]          = bcol;
+    }
+
+    Uint32 white  = SDL_MapRGBA(surf->format, 255, 255, 255, 255);
+    Uint32 yellow = SDL_MapRGBA(surf->format, 240, 230, 100, 255);
+    font_draw_str(surf, pad, pad,          line0,       white);
+    font_draw_str(surf, pad, pad + lh,     g_bdb_path,  yellow);
+    font_draw_str(surf, pad, pad + lh * 3, line2,       white);
+
+    g_popup_tex = SDL_CreateTextureFromSurface(rend, surf);
+    SDL_FreeSurface(surf);
+    if (!g_popup_tex) return;
+    SDL_SetTextureBlendMode(g_popup_tex, SDL_BLENDMODE_BLEND);
+    g_popup_w = sw;
+    g_popup_h = sh;
+    (void)ww; (void)wh;
 }
 
 /* ------------------------------------------------------------------ */
@@ -767,7 +902,6 @@ int main(int argc, char *argv[])
                     kr_next = SDL_GetTicks() + KR_DELAY_MS;
                 }
                 switch (ev.key.keysym.sym) {
-                case SDLK_ESCAPE:  running = 0; break;
                 case SDLK_LEFT:    view_x -= 64 / zoom; break;
                 case SDLK_RIGHT:   view_x += 64 / zoom; break;
                 case SDLK_UP:      view_y -= 32 / zoom; break;
@@ -778,6 +912,40 @@ int main(int argc, char *argv[])
                 case SDLK_MINUS:
                 case SDLK_KP_MINUS: if (zoom > 1) zoom--; break;
                 case SDLK_HOME:    view_x = wx_min; view_y = wy_min; zoom = 1; break;
+                case SDLK_s:
+                    if ((ev.key.keysym.mod & KMOD_CTRL) && g_have_bdb && !g_confirm_save) {
+                        g_confirm_save = 1;
+                        popup_build(rend, ww, wh);
+                    }
+                    break;
+                case SDLK_y:
+                    if (g_confirm_save) {
+                        /* backup then save */
+                        char bak[520];
+                        snprintf(bak, sizeof bak, "%s.BAK", g_bdb_path);
+                        if (!file_copy(g_bdb_path, bak))
+                            fprintf(stderr, "bdb: warning — could not create %s\n", bak);
+                        else
+                            fprintf(stderr, "bdb: backup written to %s\n", bak);
+                        bdb_save(g_bdb_path);
+                        g_confirm_save = 0;
+                        popup_free();
+                    }
+                    break;
+                case SDLK_n:
+                    if (g_confirm_save) {
+                        g_confirm_save = 0;
+                        popup_free();
+                    }
+                    break;
+                case SDLK_ESCAPE:
+                    if (g_confirm_save) {
+                        g_confirm_save = 0;
+                        popup_free();
+                    } else {
+                        running = 0;
+                    }
+                    break;
                 case SDLK_t:
                     if (ev.key.keysym.mod & KMOD_SHIFT) show_grid    ^= 1;
                     break;
@@ -961,10 +1129,18 @@ int main(int argc, char *argv[])
             SDL_RenderCopy(rend, g_tip_tex, NULL, &dst);
         }
 
+        /* Save-confirmation popup (centered) */
+        if (g_confirm_save && g_popup_tex) {
+            SDL_Rect dst = { (ww - g_popup_w) / 2, (wh - g_popup_h) / 2,
+                             g_popup_w, g_popup_h };
+            SDL_RenderCopy(rend, g_popup_tex, NULL, &dst);
+        }
+
         SDL_RenderPresent(rend);
     }
 
     /* Cleanup */
+    popup_free();
     tooltip_free();
     for (int i = 0; i < g_ni; i++)
         if (textures[i]) SDL_DestroyTexture(textures[i]);

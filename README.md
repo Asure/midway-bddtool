@@ -78,9 +78,24 @@ Files can also be **drag-and-dropped** onto the window to reload.
 | Input | Action |
 |---|---|
 | `Ctrl` + left-drag | Move the topmost object under the cursor |
+| `Ctrl+S` | Save BDB (shows confirmation popup) |
 
-When the mouse button is released the updated `depth` and `sy` coordinates
-are printed to stderr.
+When an object is dragged and released, its updated `depth` and `sy`
+coordinates are printed to stderr.
+
+#### Save confirmation popup
+
+Pressing `Ctrl+S` opens a centered popup:
+
+```
+Save changes to:
+C:\tool\CHEMLAB.BDB
+
+Y = save    N = cancel
+```
+
+- **`Y`** — backs up the original file as `<name>.BDB.BAK`, then overwrites it
+- **`N`** or **`Esc`** — cancels without saving
 
 ### Hover tooltip
 
