@@ -4,6 +4,7 @@
 param(
     [string]$SourceDir = "\\wsl.localhost\Ubuntu\home\alex\midway-bddview",
     [string]$BuildRoot = "$env:LOCALAPPDATA\bddview-build",
+    [string]$SharedDeps = "$env:LOCALAPPDATA\midway-build\deps",
     [string]$Sdl2Ver  = ""
 )
 
@@ -36,24 +37,23 @@ if (-not $Sdl2Ver) {
     } catch { $Sdl2Ver = "2.30.2"; Write-Host "[2/4] SDL2 fallback $Sdl2Ver" -ForegroundColor Cyan }
 } else { Write-Host "[2/4] SDL2 $Sdl2Ver" -ForegroundColor Cyan }
 
-$depsDir   = "$BuildRoot\deps"
-$sdl2Root  = "$depsDir\SDL2-$Sdl2Ver"
+$sdl2Root  = "$SharedDeps\SDL2-$Sdl2Ver"
 $sdl2Cmake = "$sdl2Root\cmake"
 $buildDir  = "$BuildRoot\build"
 
-New-Item -ItemType Directory -Force -Path $BuildRoot | Out-Null
-New-Item -ItemType Directory -Force -Path $depsDir   | Out-Null
-New-Item -ItemType Directory -Force -Path $buildDir  | Out-Null
+New-Item -ItemType Directory -Force -Path $BuildRoot  | Out-Null
+New-Item -ItemType Directory -Force -Path $SharedDeps | Out-Null
+New-Item -ItemType Directory -Force -Path $buildDir   | Out-Null
 
-# 3. SDL2
+# 3. SDL2 (shared with imgtool — stored in midway-build\deps)
 if (-not (Test-Path $sdl2Root)) {
     $url = "https://github.com/libsdl-org/SDL/releases/download/release-$Sdl2Ver/SDL2-devel-$Sdl2Ver-VC.zip"
-    $zip = "$depsDir\sdl2.zip"
+    $zip = "$SharedDeps\sdl2.zip"
     Write-Host "[3/4] Downloading SDL2 $Sdl2Ver ..." -ForegroundColor Cyan
     (New-Object Net.WebClient).DownloadFile($url, $zip)
-    Expand-Archive -Path $zip -DestinationPath $depsDir -Force
+    Expand-Archive -Path $zip -DestinationPath $SharedDeps -Force
     Remove-Item $zip
-} else { Write-Host "[3/4] SDL2 $Sdl2Ver already present" -ForegroundColor Cyan }
+} else { Write-Host "[3/4] SDL2 $Sdl2Ver already present (shared)" -ForegroundColor Cyan }
 
 if (-not (Test-Path $sdl2Cmake)) { Write-Error "SDL2 cmake dir not found at $sdl2Cmake"; exit 1 }
 
