@@ -9,7 +9,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-# TLS 1.2 — only needed on Windows PowerShell 5.x; PS7/.NET Core ignores this
+# TLS 1.2 - only needed on Windows PowerShell 5.x; PS7/.NET Core ignores this
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
 
 # 1. VS 2022 - check Community then BuildTools
@@ -32,7 +32,7 @@ if ($vsCmake) { Write-Host "      cmake: $vsCmake" -ForegroundColor Cyan } else 
 if (-not $Sdl2Ver) {
     Write-Host "[2/4] Querying GitHub for latest SDL2 2.x release..." -ForegroundColor Cyan
     try {
-        # Use per_page=100 — SDL3 releases now fill the first page and push SDL2 off
+        # Use per_page=100 - SDL3 releases now fill the first page and push SDL2 off
         $releases = Invoke-RestMethod "https://api.github.com/repos/libsdl-org/SDL/releases?per_page=100"
         $r = $releases | Where-Object { $_.tag_name -match '^release-2\.' } | Select-Object -First 1
         if (-not $r) { throw "No SDL2 2.x release found in API response" }
@@ -52,7 +52,7 @@ New-Item -ItemType Directory -Force -Path $BuildRoot  | Out-Null
 New-Item -ItemType Directory -Force -Path $SharedDeps | Out-Null
 New-Item -ItemType Directory -Force -Path $buildDir   | Out-Null
 
-# 3. SDL2 (shared with imgtool — stored in midway-build\deps)
+# 3. SDL2 (shared with imgtool - stored in midway-build\deps)
 if (-not (Test-Path $sdl2Root)) {
     $url = "https://github.com/libsdl-org/SDL/releases/download/release-$Sdl2Ver/SDL2-devel-$Sdl2Ver-VC.zip"
     $zip = "$SharedDeps\sdl2.zip"
