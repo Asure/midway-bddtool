@@ -9,7 +9,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+# TLS 1.2 — only needed on Windows PowerShell 5.x; PS7/.NET Core ignores this
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
 
 # 1. VS 2022 - check Community then BuildTools
 $vsRoots = @(
@@ -29,13 +30,19 @@ if ($vsCmake) { Write-Host "      cmake: $vsCmake" -ForegroundColor Cyan } else 
 
 # 2. SDL2 version
 if (-not $Sdl2Ver) {
+    Write-Host "[2/4] Querying GitHub for latest SDL2 2.x release..." -ForegroundColor Cyan
     try {
-        $r = (Invoke-RestMethod "https://api.github.com/repos/libsdl-org/SDL/releases?per_page=20") |
-             Where-Object { $_.tag_name -match '^release-2\.' } | Select-Object -First 1
+        # Use per_page=100 — SDL3 releases now fill the first page and push SDL2 off
+        $releases = Invoke-RestMethod "https://api.github.com/repos/libsdl-org/SDL/releases?per_page=100"
+        $r = $releases | Where-Object { $_.tag_name -match '^release-2\.' } | Select-Object -First 1
+        if (-not $r) { throw "No SDL2 2.x release found in API response" }
         $Sdl2Ver = $r.tag_name -replace '^release-', ''
-        Write-Host "[2/4] Latest SDL2: $Sdl2Ver" -ForegroundColor Cyan
-    } catch { $Sdl2Ver = "2.30.2"; Write-Host "[2/4] SDL2 fallback $Sdl2Ver" -ForegroundColor Cyan }
-} else { Write-Host "[2/4] SDL2 $Sdl2Ver" -ForegroundColor Cyan }
+        Write-Host "    Latest SDL2: $Sdl2Ver"
+    } catch {
+        $Sdl2Ver = "2.30.2"
+        Write-Host "    Query failed ($_), using fallback SDL2 $Sdl2Ver" -ForegroundColor Yellow
+    }
+} else { Write-Host "[2/4] Using SDL2 $Sdl2Ver" -ForegroundColor Cyan }
 
 $sdl2Root  = "$SharedDeps\SDL2-$Sdl2Ver"
 $sdl2Cmake = "$sdl2Root\cmake"
@@ -50,7 +57,7 @@ if (-not (Test-Path $sdl2Root)) {
     $url = "https://github.com/libsdl-org/SDL/releases/download/release-$Sdl2Ver/SDL2-devel-$Sdl2Ver-VC.zip"
     $zip = "$SharedDeps\sdl2.zip"
     Write-Host "[3/4] Downloading SDL2 $Sdl2Ver ..." -ForegroundColor Cyan
-    (New-Object Net.WebClient).DownloadFile($url, $zip)
+    Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
     Expand-Archive -Path $zip -DestinationPath $SharedDeps -Force
     Remove-Item $zip
 } else { Write-Host "[3/4] SDL2 $Sdl2Ver already present (shared)" -ForegroundColor Cyan }
