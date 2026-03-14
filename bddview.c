@@ -24,6 +24,7 @@
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
 #  include <windows.h>
+#  include <commdlg.h>
 #  define strcasecmp  _stricmp
 #  define strncasecmp _strnicmp
 #else
@@ -79,6 +80,15 @@ static int  g_bdb_num_modules              = 0;
 static Uint32 g_pals[MAX_PALS][256];
 static int    g_pal_count[MAX_PALS]; /* number of entries in each palette */
 static int    g_n_pals = 0;
+static char   g_pal_name[MAX_PALS][64]; /* palette names from BDD file */
+
+/* BDD file path (needed for rewrite on TGA import) */
+static char g_bdd_path[512] = "";
+
+/* TGA path-input overlay (Ctrl+L) */
+static int  g_path_input_open = 0;
+static char g_path_input_buf[512] = "";
+static int  g_path_input_len = 0;
 
 /* Tooltip texture (built on hover, freed on mouse move) */
 static SDL_Texture *g_tip_tex = NULL;
@@ -89,9 +99,25 @@ static SDL_Texture *g_popup_tex = NULL;
 static int g_popup_w, g_popup_h;
 static int g_confirm_save = 0; /* 1 = popup visible, waiting for Y/N */
 
+/* Object picker (Tab key) */
+#define PICKER_W      170  /* panel width on right edge             */
+#define PICKER_ITEM_H  70  /* row height per image entry            */
+#define PICKER_THUMB   54  /* max thumbnail size (px)               */
+
+static int           g_picker_open  = 0;
+static int           g_picker_scroll= 0;
+static int           g_place_img    = -1; /* g_img[] index pending placement */
+static SDL_Texture  *g_pick_label[MAX_IMAGES];
+static int           g_pick_labels_built = 0;
+static int           g_last_obj = -1;   /* g_obj[] index of last dragged/placed object */
+
 /* forward declarations */
 static Img *img_find(int idx);
 static void font_draw_str(SDL_Surface *surf, int x, int y, const char *s, Uint32 fg);
+static void tooltip_build_obj(SDL_Renderer *rend, int oi, int ax, int ay, int ww, int wh);
+static int  bdd_import_tga(const char *tga_path);
+static int  bdd_save(void);
+static int  file_copy(const char *src, const char *dst);
 
 /* ------------------------------------------------------------------ */
 /* BDD loader                                                           */
@@ -101,6 +127,7 @@ static int bdd_load(const char *path)
 {
     FILE *f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "bdd: cannot open %s\n", path); return 0; }
+    snprintf(g_bdd_path, sizeof g_bdd_path, "%s", path);
 
     char ln[128];
     /* first line: version/count — consume and ignore */
@@ -175,6 +202,7 @@ static int bdd_load(const char *path)
                 g_pals[pi][i] = 0xFF000000u | ((Uint32)r << 16) | ((Uint32)g << 8) | b;
             }
             for (int i = cnt; i < 256; i++) g_pals[pi][i] = 0xFF000000u;
+            snprintf(g_pal_name[pi], 64, "%s", pname);
             fprintf(stderr, "bdd: palette[%d] = %s (%d entries)\n", pi, pname, cnt);
         }
     }
@@ -304,6 +332,216 @@ static int bdb_save(const char *path)
     return 1;
 }
 
+/* System file-open dialog                                              */
+/* ------------------------------------------------------------------ */
+
+/* Opens a native file-chooser for TGA files.
+   Returns 1 and fills out[0..outsz] on success, 0 on cancel/error.
+   Falls back to the text-input overlay if no dialog tool is found.    */
+static int open_file_dialog(char *out, int outsz)
+{
+#ifdef _WIN32
+    OPENFILENAMEA ofn;
+    memset(&ofn, 0, sizeof ofn);
+    out[0] = '\0';
+    ofn.lStructSize = sizeof ofn;
+    ofn.lpstrFilter = "TGA Files\0*.TGA;*.tga\0All Files\0*.*\0";
+    ofn.lpstrFile   = out;
+    ofn.nMaxFile    = (DWORD)outsz;
+    ofn.lpstrTitle  = "Load TGA";
+    ofn.Flags       = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    return GetOpenFileNameA(&ofn) ? 1 : 0;
+#else
+    /* Try zenity, then kdialog; return 0 to trigger text-input fallback */
+    const char *cmds[] = {
+        "zenity --file-selection --title='Load TGA' "
+            "--file-filter='TGA files (*.tga *.TGA) | *.tga *.TGA' 2>/dev/null",
+        "kdialog --getopenfilename . '*.tga *.TGA' 2>/dev/null",
+        NULL
+    };
+    for (int i = 0; cmds[i]; i++) {
+        FILE *p = popen(cmds[i], "r");
+        if (!p) continue;
+        char buf[512] = "";
+        fgets(buf, sizeof buf, p);
+        pclose(p);
+        buf[strcspn(buf, "\r\n")] = '\0';
+        if (buf[0]) { snprintf(out, outsz, "%s", buf); return 1; }
+    }
+    return 0; /* no dialog tool — caller shows text input */
+#endif
+}
+
+/* BDD save — rewrites the BDD file from current g_img[] and g_pals[]  */
+/* ------------------------------------------------------------------ */
+
+static int bdd_save(void)
+{
+    if (!g_bdd_path[0]) { fprintf(stderr, "bdd: no path to save\n"); return 0; }
+
+    FILE *f = fopen(g_bdd_path, "wb");
+    if (!f) { fprintf(stderr, "bdd: cannot write %s\n", g_bdd_path); return 0; }
+
+    fprintf(f, "%d\n", g_ni);
+    for (int i = 0; i < g_ni; i++) {
+        Img *im = &g_img[i];
+        fprintf(f, "%X %d %d %d\n", im->idx, im->w, im->h, im->flags);
+        fwrite(im->pix, 1, (size_t)(im->w * im->h), f);
+    }
+    for (int i = 0; i < g_n_pals; i++) {
+        fprintf(f, "%s %d\n", g_pal_name[i], g_pal_count[i]);
+        for (int j = 0; j < g_pal_count[i]; j++) {
+            Uint32 c = g_pals[i][j];
+            Uint16 v;
+            if (j == 0) {
+                v = 0; /* transparent */
+            } else {
+                Uint8 r  = (c >> 16) & 0xFF;
+                Uint8 g2 = (c >>  8) & 0xFF;
+                Uint8 b  =  c        & 0xFF;
+                v = (Uint16)(((r >> 3) << 10) | ((g2 >> 3) << 5) | (b >> 3));
+            }
+            fwrite(&v, 2, 1, f);
+        }
+    }
+    fclose(f);
+    fprintf(stderr, "bdd: saved %d images, %d palettes to %s\n",
+            g_ni, g_n_pals, g_bdd_path);
+    return 1;
+}
+
+/* TGA loader (type 1 — 8-bit paletted with BGR555 colour map)         */
+/* ------------------------------------------------------------------ */
+
+static int tga_load(const char *path, int *out_w, int *out_h,
+                    Uint8 **out_pix, Uint16 **out_pal, int *out_pal_cnt)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "tga: cannot open %s\n", path); return 0; }
+
+    Uint8 hdr[18];
+    if (fread(hdr, 1, 18, f) < 18) { fclose(f); return 0; }
+
+    int id_len     =  hdr[0];
+    int cmap_type  =  hdr[1];
+    int img_type   =  hdr[2];
+    int cmap_count = (hdr[6] << 8) | hdr[5];
+    int cmap_depth =  hdr[7];
+    int width      = (hdr[13] << 8) | hdr[12];
+    int height     = (hdr[15] << 8) | hdr[14];
+    int pix_depth  =  hdr[16];
+    int img_desc   =  hdr[17];
+
+    if (img_type != 1 || pix_depth != 8 || cmap_type != 1) {
+        fprintf(stderr, "tga: only 8-bit paletted TGA supported (got type=%d depth=%d)\n",
+                img_type, pix_depth);
+        fclose(f); return 0;
+    }
+
+    fseek(f, id_len, SEEK_CUR);
+
+    int bpp = (cmap_depth + 7) / 8;
+    Uint16 *pal = (Uint16 *)malloc((size_t)cmap_count * sizeof(Uint16));
+    if (!pal) { fclose(f); return 0; }
+    for (int i = 0; i < cmap_count; i++) {
+        Uint8 buf[4] = {0};
+        if (fread(buf, 1, (size_t)bpp, f) != (size_t)bpp) { free(pal); fclose(f); return 0; }
+        pal[i] = (Uint16)(buf[0] | (buf[1] << 8));
+    }
+
+    int npix = width * height;
+    Uint8 *raw = (Uint8 *)malloc((size_t)npix);
+    Uint8 *pix = (Uint8 *)malloc((size_t)npix);
+    if (!raw || !pix) { free(raw); free(pix); free(pal); fclose(f); return 0; }
+    if ((int)fread(raw, 1, (size_t)npix, f) < npix) {
+        free(raw); free(pix); free(pal); fclose(f); return 0;
+    }
+    fclose(f);
+
+    /* flip vertically if origin is bottom-left (img_desc bit 5 = 0) */
+    if (img_desc & 0x20) {
+        memcpy(pix, raw, (size_t)npix);
+    } else {
+        for (int row = 0; row < height; row++)
+            memcpy(pix + row * width, raw + (height - 1 - row) * width, (size_t)width);
+    }
+    free(raw);
+
+    *out_w = width; *out_h = height;
+    *out_pix = pix; *out_pal = pal; *out_pal_cnt = cmap_count;
+    return 1;
+}
+
+/* Import a TGA into g_img[] / g_pals[] and rewrite the BDD           */
+/* ------------------------------------------------------------------ */
+
+static int bdd_import_tga(const char *tga_path)
+{
+    if (!g_bdd_path[0]) { fprintf(stderr, "tga: load a BDD first\n"); return 0; }
+    if (g_ni  >= MAX_IMAGES) { fprintf(stderr, "tga: MAX_IMAGES reached\n"); return 0; }
+    if (g_n_pals >= MAX_PALS) { fprintf(stderr, "tga: MAX_PALS reached\n"); return 0; }
+
+    int w, h, pal_cnt;
+    Uint8  *pix = NULL;
+    Uint16 *pal = NULL;
+    if (!tga_load(tga_path, &w, &h, &pix, &pal, &pal_cnt)) return 0;
+
+    /* new image idx = max existing + 1 */
+    int max_idx = 0;
+    for (int i = 0; i < g_ni; i++)
+        if (g_img[i].idx > max_idx) max_idx = g_img[i].idx;
+    int new_idx = max_idx + 1;
+
+    /* add palette */
+    int pi = g_n_pals++;
+    g_pal_count[pi] = pal_cnt;
+
+    /* derive palette name from filename (no path, no extension, uppercase) */
+    const char *base = tga_path;
+    for (const char *s = tga_path; *s; s++)
+        if (*s == '/' || *s == '\\') base = s + 1;
+    snprintf(g_pal_name[pi], 64, "%s", base);
+    char *dot = strrchr(g_pal_name[pi], '.');
+    if (dot) *dot = '\0';
+    for (char *p = g_pal_name[pi]; *p; p++)
+        if (*p >= 'a' && *p <= 'z') *p = (char)(*p - 32);
+
+    for (int i = 0; i < pal_cnt; i++) {
+        Uint16 c = pal[i];
+        if (i == 0) {
+            g_pals[pi][i] = 0;
+        } else {
+            Uint8 r  = (Uint8)(((c >> 10) & 0x1F) << 3);
+            Uint8 g2 = (Uint8)(((c >>  5) & 0x1F) << 3);
+            Uint8 b  = (Uint8)( (c        & 0x1F) << 3);
+            g_pals[pi][i] = 0xFF000000u | ((Uint32)r << 16) | ((Uint32)g2 << 8) | b;
+        }
+    }
+    for (int i = pal_cnt; i < 256; i++) g_pals[pi][i] = 0xFF000000u;
+    free(pal);
+
+    /* add image */
+    Img *im    = &g_img[g_ni++];
+    im->idx    = new_idx;
+    im->w      = w;
+    im->h      = h;
+    im->flags  = 0;
+    im->pal_idx = pi;
+    im->pix    = pix;
+
+    /* backup and rewrite BDD */
+    char bak[520];
+    snprintf(bak, sizeof bak, "%s.BAK", g_bdd_path);
+    file_copy(g_bdd_path, bak);
+    bdd_save();
+
+    g_pick_labels_built = 0;
+
+    fprintf(stderr, "tga: imported %s as idx=0x%02X  pal=%d  %dx%d\n",
+            tga_path, new_idx, pi, w, h);
+    return 1;
+}
+
 /* Copy src → dst byte-for-byte (used for .BAK) */
 static int file_copy(const char *src, const char *dst)
 {
@@ -353,7 +591,6 @@ static void popup_build(SDL_Renderer *rend, int ww, int wh)
     SDL_FillRect(surf, NULL, SDL_MapRGBA(surf->format, 20, 20, 36, 240));
 
     /* border */
-    SDL_Rect border = { 0, 0, sw, sh };
     Uint32 bcol = SDL_MapRGBA(surf->format, 200, 200, 80, 255);
     for (int x = 0; x < sw; x++) {
         ((Uint32 *)surf->pixels)[x]                        = bcol;
@@ -380,6 +617,151 @@ static void popup_build(SDL_Renderer *rend, int ww, int wh)
 }
 
 /* ------------------------------------------------------------------ */
+/* Path-input overlay (Ctrl+L)                                          */
+/* ------------------------------------------------------------------ */
+
+static void draw_path_input(SDL_Renderer *rend, int ww, int wh)
+{
+    int bw = 480, bh = 52;
+    int bx = (ww - bw) / 2, by = (wh - bh) / 2;
+
+    SDL_SetRenderDrawBlendMode(rend, SDL_BLENDMODE_BLEND);
+    SDL_Rect bg = { bx, by, bw, bh };
+    SDL_SetRenderDrawColor(rend, 14, 14, 26, 245);
+    SDL_RenderFillRect(rend, &bg);
+    SDL_SetRenderDrawColor(rend, 180, 180, 80, 255);
+    SDL_RenderDrawRect(rend, &bg);
+
+    /* label */
+    SDL_Surface *surf = SDL_CreateRGBSurface(0, bw - 8, 38, 32,
+        0x00FF0000u, 0x0000FF00u, 0x000000FFu, 0xFF000000u);
+    if (!surf) return;
+    SDL_FillRect(surf, NULL, 0);
+    Uint32 lc = SDL_MapRGBA(surf->format, 180, 180, 100, 255);
+    Uint32 tc = SDL_MapRGBA(surf->format, 220, 220, 255, 255);
+    font_draw_str(surf, 0, 0,  "Load TGA — enter path and press Enter:", lc);
+    /* draw input text with blinking cursor */
+    char display[520];
+    snprintf(display, sizeof display, "%s", g_path_input_buf);
+    if ((SDL_GetTicks() / 500) % 2 == 0) {
+        int len = (int)strlen(display);
+        if (len < (int)sizeof(display) - 1) { display[len] = '_'; display[len+1] = '\0'; }
+    }
+    font_draw_str(surf, 0, 14, display, tc);
+
+    SDL_Texture *tex = SDL_CreateTextureFromSurface(rend, surf);
+    SDL_FreeSurface(surf);
+    if (!tex) return;
+    SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_BLEND);
+    SDL_Rect dst = { bx + 4, by + 7, bw - 8, 38 };
+    SDL_RenderCopy(rend, tex, NULL, &dst);
+    SDL_DestroyTexture(tex);
+}
+
+/* Object picker functions                                              */
+/* ------------------------------------------------------------------ */
+
+static void picker_free_labels(void)
+{
+    for (int i = 0; i < MAX_IMAGES; i++) {
+        if (g_pick_label[i]) { SDL_DestroyTexture(g_pick_label[i]); g_pick_label[i] = NULL; }
+    }
+    g_pick_labels_built = 0;
+}
+
+static void picker_build_labels(SDL_Renderer *rend)
+{
+    for (int i = 0; i < g_ni; i++) {
+        if (g_pick_label[i]) continue;
+        Img *im = &g_img[i];
+        char l1[24], l2[20];
+        snprintf(l1, sizeof l1, "ii=0x%02X", im->idx);
+        snprintf(l2, sizeof l2, "%d x %d",   im->w, im->h);
+        int sw = (int)(strlen(l1) > strlen(l2) ? strlen(l1) : strlen(l2)) * 8;
+        SDL_Surface *s = SDL_CreateRGBSurface(0, sw, 19, 32,
+            0x00FF0000u, 0x0000FF00u, 0x000000FFu, 0xFF000000u);
+        if (!s) continue;
+        SDL_FillRect(s, NULL, 0);
+        font_draw_str(s, 0,  0, l1, SDL_MapRGBA(s->format, 210, 220, 255, 255));
+        font_draw_str(s, 0, 11, l2, SDL_MapRGBA(s->format, 150, 200, 150, 255));
+        g_pick_label[i] = SDL_CreateTextureFromSurface(rend, s);
+        SDL_FreeSurface(s);
+        if (g_pick_label[i])
+            SDL_SetTextureBlendMode(g_pick_label[i], SDL_BLENDMODE_BLEND);
+    }
+    g_pick_labels_built = 1;
+}
+
+static void draw_picker(SDL_Renderer *rend, SDL_Texture **textures,
+                        int ww, int wh, int mx, int my)
+{
+    if (!g_pick_labels_built) picker_build_labels(rend);
+
+    int px  = ww - PICKER_W;
+    int pad = 6;
+
+    /* background */
+    SDL_SetRenderDrawBlendMode(rend, SDL_BLENDMODE_BLEND);
+    SDL_Rect bg = { px, 0, PICKER_W, wh };
+    SDL_SetRenderDrawColor(rend, 14, 14, 26, 242);
+    SDL_RenderFillRect(rend, &bg);
+    SDL_SetRenderDrawColor(rend, 80, 80, 150, 255);
+    SDL_RenderDrawLine(rend, px, 0, px, wh);
+
+    for (int i = g_picker_scroll; i < g_ni; i++) {
+        int iy = (i - g_picker_scroll) * PICKER_ITEM_H;
+        if (iy >= wh) break;
+
+        Img *im = &g_img[i];
+
+        /* hover highlight */
+        if (mx >= px && my >= iy && my < iy + PICKER_ITEM_H) {
+            SDL_Rect hi = { px + 1, iy, PICKER_W - 1, PICKER_ITEM_H - 1 };
+            SDL_SetRenderDrawColor(rend, 55, 55, 110, 200);
+            SDL_RenderFillRect(rend, &hi);
+        }
+
+        /* thumbnail — scale to fit PICKER_THUMB box */
+        if (textures[i]) {
+            float sc = (float)PICKER_THUMB / (float)(im->w > im->h ? im->w : im->h);
+            if (sc > 1.0f) sc = 1.0f;
+            int tw = (int)(im->w * sc), th = (int)(im->h * sc);
+            SDL_Rect dst = {
+                px + pad + (PICKER_THUMB - tw) / 2,
+                iy + (PICKER_ITEM_H - th) / 2,
+                tw, th
+            };
+            SDL_RenderCopy(rend, textures[i], NULL, &dst);
+        }
+
+        /* label */
+        if (g_pick_label[i]) {
+            int lx = px + pad + PICKER_THUMB + 6;
+            SDL_Rect ldst = { lx, iy + (PICKER_ITEM_H - 19) / 2,
+                              PICKER_W - (lx - px) - 4, 19 };
+            SDL_RenderCopy(rend, g_pick_label[i], NULL, &ldst);
+        }
+
+        /* divider */
+        SDL_SetRenderDrawColor(rend, 35, 35, 55, 255);
+        SDL_RenderDrawLine(rend, px, iy + PICKER_ITEM_H - 1,
+                           px + PICKER_W, iy + PICKER_ITEM_H - 1);
+    }
+
+    /* scroll arrows */
+    SDL_SetRenderDrawColor(rend, 140, 140, 210, 255);
+    if (g_picker_scroll > 0) {
+        int ax = px + PICKER_W - 10;
+        SDL_RenderDrawLine(rend, ax - 5, 14, ax, 6);
+        SDL_RenderDrawLine(rend, ax,     6,  ax + 5, 14);
+    }
+    if (g_picker_scroll + wh / PICKER_ITEM_H < g_ni - 1) {
+        int ax = px + PICKER_W - 10;
+        SDL_RenderDrawLine(rend, ax - 5, wh - 14, ax, wh - 6);
+        SDL_RenderDrawLine(rend, ax,     wh - 6,  ax + 5, wh - 14);
+    }
+}
+
 /* Helpers                                                              */
 /* ------------------------------------------------------------------ */
 
@@ -672,6 +1054,66 @@ static void tooltip_build(SDL_Renderer *rend,
     if (g_tip_y + sh > wh) g_tip_y = my - sh - 4;
 }
 
+/* Build tooltip for a single known object — used for real-time WX feedback */
+static void tooltip_build_obj(SDL_Renderer *rend, int oi,
+                               int ax, int ay, int ww, int wh)
+{
+    tooltip_free();
+    if (oi < 0 || oi >= g_no) return;
+
+    Obj *o  = &g_obj[oi];
+    Img *im = img_find(o->ii);
+    int pal = im ? ((im->pal_idx >= 0) ? im->pal_idx : o->fl) : o->fl;
+
+    char lines[4][TIP_COL];
+    int  nl = 0;
+    snprintf(lines[nl++], TIP_COL,
+        "[%d] ii=0x%04X  %dx%d  pal=%d",
+        oi, o->ii, im ? im->w : 0, im ? im->h : 0, pal);
+    snprintf(lines[nl++], TIP_COL,
+        "  Z=%-4d sy=%-4d  wx=0x%04X  hfl=%d vfl=%d",
+        o->depth, o->sy, o->wx, o->hfl, o->vfl);
+    snprintf(lines[nl++], TIP_COL,
+        "  layer 0x%02X", (o->wx >> 8) & 0xFF);
+
+    int max_chars = 0;
+    for (int i = 0; i < nl; i++) {
+        int l = (int)strlen(lines[i]);
+        if (l > max_chars) max_chars = l;
+    }
+    int sw = max_chars * 8 + TIP_PAD * 2;
+    int sh = nl * TIP_LH  + TIP_PAD * 2;
+
+    SDL_Surface *surf = SDL_CreateRGBSurface(0, sw, sh, 32,
+        0x00FF0000u, 0x0000FF00u, 0x000000FFu, 0xFF000000u);
+    if (!surf) return;
+    SDL_FillRect(surf, NULL, SDL_MapRGBA(surf->format, 14, 14, 24, 225));
+    {
+        Uint32 bc = SDL_MapRGBA(surf->format, 110, 200, 110, 255); /* green border = editing */
+        int pitch = surf->pitch / 4;
+        Uint32 *px = (Uint32 *)surf->pixels;
+        for (int x = 0; x < sw; x++) { px[x] = bc; px[(sh-1)*pitch+x] = bc; }
+        for (int y = 0; y < sh; y++) { px[y*pitch] = bc; px[y*pitch+sw-1] = bc; }
+    }
+    Uint32 fg0 = SDL_MapRGBA(surf->format, 240, 230, 150, 255);
+    Uint32 fg1 = SDL_MapRGBA(surf->format, 120, 240, 140, 255); /* bright green for layer line */
+    font_draw_str(surf, TIP_PAD, TIP_PAD + 0 * TIP_LH, lines[0], fg0);
+    font_draw_str(surf, TIP_PAD, TIP_PAD + 1 * TIP_LH, lines[1], fg0);
+    font_draw_str(surf, TIP_PAD, TIP_PAD + 2 * TIP_LH, lines[2], fg1);
+
+    SDL_SetSurfaceBlendMode(surf, SDL_BLENDMODE_BLEND);
+    g_tip_tex = SDL_CreateTextureFromSurface(rend, surf);
+    SDL_FreeSurface(surf);
+    if (!g_tip_tex) return;
+    SDL_SetTextureBlendMode(g_tip_tex, SDL_BLENDMODE_BLEND);
+
+    g_tip_w = sw; g_tip_h = sh;
+    g_tip_x = ax + 14;
+    g_tip_y = ay + 14;
+    if (g_tip_x + sw > ww) g_tip_x = ax - sw - 4;
+    if (g_tip_y + sh > wh) g_tip_y = ay - sh - 4;
+}
+
 /* ------------------------------------------------------------------ */
 /* Image-grid view (BDD only, no BDB)                                  */
 /* ------------------------------------------------------------------ */
@@ -861,6 +1303,8 @@ int main(int argc, char *argv[])
 
             case SDL_DROPFILE:
                 /* Re-load if user drops a new file */
+                picker_free_labels();
+                g_picker_open = 0; g_place_img = -1;
                 img_free();
                 g_no = 0; g_have_bdb = 0; g_name[0] = '\0';
                 for (int i = 0; i < g_ni; i++)
@@ -901,6 +1345,30 @@ int main(int argc, char *argv[])
                     kr_sym  = ev.key.keysym.sym;
                     kr_next = SDL_GetTicks() + KR_DELAY_MS;
                 }
+                /* path-input mode: handle backspace/return, swallow everything else */
+                if (g_path_input_open) {
+                    if (ev.key.keysym.sym == SDLK_BACKSPACE && g_path_input_len > 0) {
+                        g_path_input_buf[--g_path_input_len] = '\0';
+                    } else if (ev.key.keysym.sym == SDLK_RETURN ||
+                               ev.key.keysym.sym == SDLK_KP_ENTER) {
+                        g_path_input_open = 0;
+                        SDL_StopTextInput();
+                        if (g_path_input_len > 0) {
+                            /* import TGA then rebuild textures */
+                            int old_ni = g_ni;
+                            if (bdd_import_tga(g_path_input_buf) && g_ni > old_ni) {
+                                textures = (SDL_Texture **)realloc(
+                                    textures, (size_t)g_ni * sizeof(SDL_Texture *));
+                                for (int i = old_ni; i < g_ni; i++)
+                                    textures[i] = img_to_tex(rend, &g_img[i]);
+                            }
+                        }
+                    } else if (ev.key.keysym.sym == SDLK_ESCAPE) {
+                        g_path_input_open = 0;
+                        SDL_StopTextInput();
+                    }
+                    break;
+                }
                 switch (ev.key.keysym.sym) {
                 case SDLK_LEFT:    view_x -= 64 / zoom; break;
                 case SDLK_RIGHT:   view_x += 64 / zoom; break;
@@ -938,12 +1406,62 @@ int main(int argc, char *argv[])
                         popup_free();
                     }
                     break;
+                case SDLK_l:
+                    if ((ev.key.keysym.mod & KMOD_CTRL) && !g_path_input_open) {
+                        char dlg_path[512] = "";
+                        if (open_file_dialog(dlg_path, sizeof dlg_path)) {
+                            /* dialog returned a path — import immediately */
+                            int old_ni = g_ni;
+                            if (bdd_import_tga(dlg_path) && g_ni > old_ni) {
+                                textures = (SDL_Texture **)realloc(
+                                    textures, (size_t)g_ni * sizeof(SDL_Texture *));
+                                for (int i = old_ni; i < g_ni; i++)
+                                    textures[i] = img_to_tex(rend, &g_img[i]);
+                            }
+                        } else {
+                            /* no system dialog — fall back to text input */
+                            g_path_input_open = 1;
+                            g_path_input_buf[0] = '\0';
+                            g_path_input_len = 0;
+                            SDL_StartTextInput();
+                        }
+                    }
+                    break;
+                case SDLK_TAB:
+                    if (g_have_bdb) {
+                        g_picker_open ^= 1;
+                        g_place_img = -1;
+                    }
+                    break;
                 case SDLK_ESCAPE:
-                    if (g_confirm_save) {
+                    if (g_path_input_open) {
+                        g_path_input_open = 0;
+                        SDL_StopTextInput();
+                    } else if (g_confirm_save) {
                         g_confirm_save = 0;
                         popup_free();
+                    } else if (g_place_img >= 0) {
+                        g_place_img = -1;
+                    } else if (g_picker_open) {
+                        g_picker_open = 0;
                     } else {
                         running = 0;
+                    }
+                    break;
+                case SDLK_z:
+                    if (g_last_obj >= 0 && g_last_obj < g_no) {
+                        Obj *o = &g_obj[g_last_obj];
+                        o->hfl ^= 1;
+                        o->wx  = (o->wx & ~0x10) | (o->hfl ? 0x10 : 0);
+                        fprintf(stderr, "obj[%d] hfl=%d\n", g_last_obj, o->hfl);
+                    }
+                    break;
+                case SDLK_x:
+                    if (g_last_obj >= 0 && g_last_obj < g_no) {
+                        Obj *o = &g_obj[g_last_obj];
+                        o->vfl ^= 1;
+                        o->wx  = (o->wx & ~0x20) | (o->vfl ? 0x20 : 0);
+                        fprintf(stderr, "obj[%d] vfl=%d\n", g_last_obj, o->vfl);
                     }
                     break;
                 case SDLK_t:
@@ -963,12 +1481,58 @@ int main(int argc, char *argv[])
                     kr_sym = SDLK_UNKNOWN;
                 break;
 
+            case SDL_TEXTINPUT:
+                if (g_path_input_open) {
+                    int add = (int)strlen(ev.text.text);
+                    if (g_path_input_len + add < (int)sizeof(g_path_input_buf) - 1) {
+                        memcpy(g_path_input_buf + g_path_input_len, ev.text.text, (size_t)add);
+                        g_path_input_len += add;
+                        g_path_input_buf[g_path_input_len] = '\0';
+                    }
+                }
+                break;
+
             case SDL_MOUSEBUTTONDOWN:
                 if (ev.button.button == SDL_BUTTON_LEFT) {
-                    if (ev.button.clicks >= 1 && (SDL_GetModState() & KMOD_CTRL) && g_have_bdb) {
-                        /* Ctrl+LMB — pick topmost object under cursor */
-                        int wx2 = ev.button.x / zoom + view_x;
-                        int wy2 = ev.button.y / zoom + view_y;
+                    int bx = ev.button.x, by = ev.button.y;
+                    if (g_picker_open && bx >= ww - PICKER_W) {
+                        /* click inside picker panel — select image */
+                        int idx = g_picker_scroll + by / PICKER_ITEM_H;
+                        if (idx >= 0 && idx < g_ni) {
+                            g_place_img   = idx;
+                            g_picker_open = 0;
+                        }
+                    } else if (g_place_img >= 0) {
+                        /* place new object at cursor world position */
+                        if (g_no < MAX_OBJECTS) {
+                            Obj *o  = &g_obj[g_no];
+                            Img *im = &g_img[g_place_img];
+                            o->wx    = 0x4100;
+                            o->depth = bx / zoom + view_x;
+                            o->sy    = by / zoom + view_y;
+                            o->ii    = im->idx;
+                            o->fl    = (im->pal_idx >= 0) ? im->pal_idx : 0;
+                            o->hfl   = 0;
+                            o->vfl   = 0;
+                            o->order = g_no;
+                            g_no++;
+                            /* insert into sorted position */
+                            Obj tmp = g_obj[g_no - 1];
+                            int key = (tmp.wx >> 8) & 0xFF;
+                            int j   = g_no - 2;
+                            while (j >= 0 && (((g_obj[j].wx >> 8) & 0xFF) > key ||
+                                              (((g_obj[j].wx >> 8) & 0xFF) == key &&
+                                               g_obj[j].order > tmp.order))) {
+                                g_obj[j + 1] = g_obj[j]; j--;
+                            }
+                            g_obj[j + 1] = tmp;
+                            g_last_obj = (int)((&g_obj[j + 1]) - g_obj);
+                        }
+                        g_place_img = -1;
+                    } else if ((SDL_GetModState() & KMOD_CTRL) && g_have_bdb) {
+                        /* Ctrl+LMB — drag existing object */
+                        int wx2 = bx / zoom + view_x;
+                        int wy2 = by / zoom + view_y;
                         obj_drag_idx = -1;
                         for (int i = g_no - 1; i >= 0; i--) {
                             Obj *o  = &g_obj[i];
@@ -977,19 +1541,21 @@ int main(int argc, char *argv[])
                             if (wx2 < o->depth || wx2 >= o->depth + im->w) continue;
                             if (wy2 < o->sy    || wy2 >= o->sy    + im->h) continue;
                             obj_drag_idx    = i;
-                            obj_drag_ox     = ev.button.x;
-                            obj_drag_oy     = ev.button.y;
+                            obj_drag_ox     = bx;
+                            obj_drag_oy     = by;
                             obj_drag_depth0 = o->depth;
                             obj_drag_sy0    = o->sy;
                             tooltip_free();
                             break;
                         }
-                    } else {
+                    } else if (!g_picker_open) {
                         dragging = 1;
-                        drag_ox = ev.button.x; drag_oy = ev.button.y;
-                        drag_vx = view_x;      drag_vy = view_y;
+                        drag_ox = bx; drag_oy = by;
+                        drag_vx = view_x; drag_vy = view_y;
                     }
                 }
+                if (ev.button.button == SDL_BUTTON_RIGHT && g_place_img >= 0)
+                    g_place_img = -1;
                 break;
 
             case SDL_MOUSEBUTTONUP:
@@ -998,6 +1564,7 @@ int main(int argc, char *argv[])
                         Obj *o = &g_obj[obj_drag_idx];
                         fprintf(stderr, "obj[%d] moved to depth=%d sy=%d\n",
                                 obj_drag_idx, o->depth, o->sy);
+                        g_last_obj   = obj_drag_idx;
                         obj_drag_idx = -1;
                     }
                     dragging = 0;
@@ -1023,8 +1590,38 @@ int main(int argc, char *argv[])
                 break;
 
             case SDL_MOUSEWHEEL:
-                if (ev.wheel.y > 0 && zoom < 8) zoom++;
-                if (ev.wheel.y < 0 && zoom > 1) zoom--;
+                if (g_picker_open) {
+                    if (ev.wheel.y < 0 && g_picker_scroll < g_ni - 1) g_picker_scroll++;
+                    if (ev.wheel.y > 0 && g_picker_scroll > 0)        g_picker_scroll--;
+                } else if ((SDL_GetModState() & KMOD_CTRL) && g_last_obj >= 0 && g_last_obj < g_no) {
+                    /* Ctrl+wheel — adjust wx high byte (parallax layer) of last object */
+                    int saved_order = g_obj[g_last_obj].order;
+                    Obj *o = &g_obj[g_last_obj];
+                    int hi = (o->wx >> 8) & 0xFF;
+                    hi = (ev.wheel.y > 0) ? (hi + 1) & 0xFF : (hi - 1) & 0xFF;
+                    o->wx = (hi << 8) | (o->wx & 0xFF);
+                    /* re-sort */
+                    for (int i = 1; i < g_no; i++) {
+                        Obj tmp = g_obj[i];
+                        int key = (tmp.wx >> 8) & 0xFF;
+                        int j   = i - 1;
+                        while (j >= 0 && (((g_obj[j].wx >> 8) & 0xFF) > key ||
+                                          (((g_obj[j].wx >> 8) & 0xFF) == key &&
+                                           g_obj[j].order > tmp.order))) {
+                            g_obj[j + 1] = g_obj[j]; j--;
+                        }
+                        g_obj[j + 1] = tmp;
+                    }
+                    /* find new position of the moved object and update tooltip */
+                    for (int i = 0; i < g_no; i++) {
+                        if (g_obj[i].order == saved_order) { g_last_obj = i; break; }
+                    }
+                    tooltip_build_obj(rend, g_last_obj, hover_x, hover_y, ww, wh);
+                    hover_printed = 1; /* suppress auto-hover overwrite */
+                } else {
+                    if (ev.wheel.y > 0 && zoom < 8) zoom++;
+                    if (ev.wheel.y < 0 && zoom > 1) zoom--;
+                }
                 break;
             }
         }
@@ -1123,6 +1720,23 @@ int main(int argc, char *argv[])
             }
         }
 
+        /* Path-input overlay */
+        if (g_path_input_open)
+            draw_path_input(rend, ww, wh);
+
+        /* Ghost image — follows cursor when a placement is pending */
+        if (g_place_img >= 0 && g_place_img < g_ni && textures[g_place_img]) {
+            Img *im = &g_img[g_place_img];
+            SDL_Rect dst = { hover_x, hover_y, im->w * zoom, im->h * zoom };
+            SDL_SetTextureAlphaMod(textures[g_place_img], 160);
+            SDL_RenderCopy(rend, textures[g_place_img], NULL, &dst);
+            SDL_SetTextureAlphaMod(textures[g_place_img], 255);
+        }
+
+        /* Object picker panel */
+        if (g_picker_open)
+            draw_picker(rend, textures, ww, wh, hover_x, hover_y);
+
         /* Tooltip overlay */
         if (g_tip_tex) {
             SDL_Rect dst = { g_tip_x, g_tip_y, g_tip_w, g_tip_h };
@@ -1140,6 +1754,7 @@ int main(int argc, char *argv[])
     }
 
     /* Cleanup */
+    picker_free_labels();
     popup_free();
     tooltip_free();
     for (int i = 0; i < g_ni; i++)

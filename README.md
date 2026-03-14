@@ -63,7 +63,7 @@ Files can also be **drag-and-dropped** onto the window to reload.
 | Scroll wheel | Zoom in / out |
 | `+` / `-` | Zoom in / out |
 | `Home` | Reset view and zoom |
-| `Esc` | Quit |
+| `Esc` | Quit (or dismiss active popup/mode) |
 
 ### Toggles
 
@@ -78,10 +78,16 @@ Files can also be **drag-and-dropped** onto the window to reload.
 | Input | Action |
 |---|---|
 | `Ctrl` + left-drag | Move the topmost object under the cursor |
+| `Z` | Toggle horizontal flip on last moved/placed object |
+| `X` | Toggle vertical flip on last moved/placed object |
+| `Ctrl` + scroll wheel | Adjust parallax layer (`wx` high byte) of last object |
 | `Ctrl+S` | Save BDB (shows confirmation popup) |
+| `Tab` | Open / close object picker |
+| `Ctrl+L` | Import a TGA file as a new sprite |
 
 When an object is dragged and released, its updated `depth` and `sy`
-coordinates are printed to stderr.
+coordinates are printed to stderr. `Z` / `X` also update the `wx` field so
+the flip is preserved on save.
 
 #### Save confirmation popup
 
@@ -97,10 +103,42 @@ Y = save    N = cancel
 - **`Y`** — backs up the original file as `<name>.BDB.BAK`, then overwrites it
 - **`N`** or **`Esc`** — cancels without saving
 
+#### Object picker (Tab)
+
+Opens a scrollable panel on the right side of the screen listing every image
+loaded from the BDD file.
+
+- **Scroll wheel** — scroll through the list
+- **Click an image** — closes the picker; the sprite follows the cursor as a
+  semi-transparent ghost
+- **Left click in the world** — places the object at that position
+  (default layer `wx=0x4100`)
+- **Right click** or **`Esc`** — cancel placement
+
+#### TGA import (Ctrl+L)
+
+Imports an 8-bit paletted TGA file as a new sprite and appends it (plus its
+palette) to the BDD file.
+
+- **Windows** — opens a native file-chooser dialog filtered to `*.TGA`
+- **Linux** — uses `zenity` or `kdialog` if available; otherwise falls back
+  to a path-input text box
+
+The TGA must be **8-bit paletted** with a **15-bit (BGR555) colour map**
+(the native format used by the Midway toolchain). A `.BAK` backup of the BDD
+is created before the file is rewritten. The new image is immediately
+available in the object picker.
+
+#### Parallax layer adjustment
+
+`Ctrl` + scroll wheel changes the `wx` high byte of the last touched object,
+moving it between parallax layers. The draw order updates immediately and a
+tooltip (green border) shows the current `wx` value and layer in real time.
+
 ### Hover tooltip
 
-Hold the mouse still over any sprite for **1.2 seconds** to see a tooltip
-with debug info for every object under the cursor:
+Hold the mouse still over any sprite for **1.2 seconds** to see debug info
+for every object under the cursor:
 
 ```
 [42] ii=0x000C  48x57  pal=0
@@ -256,6 +294,6 @@ the **first** assignment wins.
 
 ```
 bddview.c       Main source (C99)
-CMakeLists.txt  Build system (SDL2 — Linux + Windows)
+CMakeLists.txt  Build system (SDL2 + comdlg32 on Windows)
 build.ps1       Windows one-shot build script (VS 2022 + SDL2 auto-download)
 ```
